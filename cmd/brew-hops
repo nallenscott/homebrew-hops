@@ -1,0 +1,422 @@
+#!/bin/bash
+
+#:  * `hops` [<subcommand>] [<options>]
+#:
+#:  Manage Homebrew on multiple machines, and sync state between them.
+#:
+#:  `brew hops` [`init`]:
+#:  Initializes hops on the host machine. This will generate a Brewfile, and place it in `~/.hops/Brewfile`. Requires the --token option to specify a Github token with gist permissions.
+#:
+#:  `brew hops` [`sync`]:
+#:  Refreshes the local state and pushes the updated Brewfile to gist. Using the --host option will overwrite the local state with the state of the specified remote host.
+#:
+#:        --token                      Github token with gist permissions.
+#:        --host                       Name of a remote host to sync with.
+#:    -v, --version                    Print version info.
+#:    -d, --debug                      Enable debug mode.
+
+# -----------------------------------------------
+# Config variables:
+# -----------------------------------------------
+HOPS_HOME="$HOME/.hops"
+HOPS_FILE="$HOPS_HOME/Hopsfile"
+BREW_FILE="$HOPS_HOME/Brewfile"
+HOPS_BANNER="$(dirname "$0")/../tmpl/.hops"
+HOPS_DESC="A backend for homebrew 🍻"
+GITHUB_TOKEN=""
+GIST_ID=""
+
+# -----------------------------------------------
+# Runtime variables:
+# -----------------------------------------------
+TOKEN_UPDATED=false
+INITIAL_SYNC=false
+PRINT_DEBUG=false
+REMOTE_HOST=""
+GIST_URL=""
+
+# -----------------------------------------------
+# Formatted output:
+# -----------------------------------------------
+GRNARW=$'\e[1;32m==>\e[0m'
+BLUARW=$'\e[1;34m==>\e[0m'
+
+# -----------------------------------------------
+# Prints the latest git tag.
+# -----------------------------------------------
+print_version() {
+  echo "v$(git describe --tags --abbrev=0)"
+}
+
+# -----------------------------------------------
+# Prints the values of global variables at time
+# of execution. Can be called with the --debug
+# option, and may be called by other functions.
+# -----------------------------------------------
+print_debug() {
+  if [ "$PRINT_DEBUG" = true ]; then
+    echo ""
+    echo "Debug information:"
+    echo "------------------------------"
+    echo "HOPS_HOME:     ${HOPS_HOME:-n/a}"
+    echo "HOPS_FILE:     ${HOPS_FILE:-n/a}"
+    echo "BREW_FILE:     ${BREW_FILE:-n/a}"
+    echo "GIST_ID:       ${GIST_ID:-n/a}"
+    echo "GIST_URL:      ${GIST_URL:-n/a}"
+    echo "GITHUB_TOKEN:  ${GITHUB_TOKEN:-n/a}"
+    echo "REMOTE_HOST:   ${REMOTE_HOST:-n/a}"
+    echo "TOKEN_UPDATED: ${TOKEN_UPDATED:-n/a}"
+    echo "INITIAL_SYNC:  ${INITIAL_SYNC:-n/a}"
+  fi
+}
+
+# -----------------------------------------------
+# Checks if deps are installed, and prompts user
+# to install them if not. Exits if user declines.
+# -----------------------------------------------
+install_deps() {
+  deps=("gh")
+
+  if ! brew tap | grep -q "homebrew/bundle"; then
+    brew tap homebrew/bundle --quiet
+  fi
+
+  for dep in "${deps[@]}"; do
+    if ! command -v "$dep" >/dev/null; then
+      read -p "Hops requires $dep to be installed. Install it? [y/N] " -r opt && echo
+      if [[ "$opt" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+        brew install "$dep" --quiet
+      else
+        echo -e "\nAborted. Install $dep and try again."
+        exit 1
+      fi
+    fi
+  done
+}
+
+# -----------------------------------------------
+# Parses command line args, and sets global vars.
+# -----------------------------------------------
+parse_args() {
+  POSITIONAL_ARGS=()
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --token)
+        if [ -n "$GITHUB_TOKEN" ]; then
+          TOKEN_UPDATED=true
+        fi
+        GITHUB_TOKEN="$2"
+        shift
+        shift
+        ;;
+      --host)
+        REMOTE_HOST="$2"
+        shift
+        shift
+        ;;
+      -v|--version)
+        print_version
+        exit 0
+        ;;
+      -d|--debug)
+        PRINT_DEBUG=true
+        shift
+        ;;
+      -*)
+        echo "Unknown option: $1"
+        exit 1
+        ;;
+      *)
+        POSITIONAL_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # restore positional params
+  set -- "${POSITIONAL_ARGS[@]}"
+}
+
+# -----------------------------------------------
+# Checks if required init args are present, and
+# exits if not.
+# -----------------------------------------------
+check_args() {
+  if [ -z "$GITHUB_TOKEN" ]; then
+    echo -e "\nAborted. Use the --token option to specify a Github token."
+    print_debug
+    exit 1
+  fi
+}
+
+# -----------------------------------------------
+# Loads the Hopsfile into the environment.
+# -----------------------------------------------
+load_backend() {
+  if [ -f "$HOPS_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$HOPS_FILE"
+    echo "$GRNARW Loaded Hopsfile"
+  fi
+}
+
+# -----------------------------------------------
+# Creates the hops home directory, and the hops
+# config file if they don't already exist.
+# -----------------------------------------------
+create_home() {
+  # check if home directory exists
+  if [ ! -d "$HOPS_HOME" ]; then
+    mkdir "$HOPS_HOME"
+    echo "$GRNARW Created hops directory $HOPS_HOME"
+  fi
+
+  # check if backend file exists
+  if [ ! -f "$HOPS_FILE" ]; then
+    cat <<EOF > "$HOPS_FILE"
+GITHUB_TOKEN="$GITHUB_TOKEN"
+GIST_ID=""
+EOF
+    echo "$GRNARW Created Hopsfile $HOPS_FILE"
+  fi
+}
+
+# -----------------------------------------------
+# Updates the github token in the Hopsfile.
+# Called when the --token option is used after
+# the backend has been initialized.
+# -----------------------------------------------
+update_token() {
+  if [ "$TOKEN_UPDATED" = true ]; then
+    sed -i '' "s/GITHUB_TOKEN=.*/GITHUB_TOKEN=\"$GITHUB_TOKEN\"/" "$HOPS_FILE"
+    echo "$GRNARW Updated github token"
+  fi
+}
+
+# -----------------------------------------------
+# Checks if backend is configured.
+# -----------------------------------------------
+check_backend() {
+  if [ -z "$GIST_ID" ] || [ -z "$GITHUB_TOKEN" ]; then
+    echo -e "\nAborted. Backend not configured. Run 'brew hops init' to get started."
+    exit 1
+  fi
+}
+
+# -----------------------------------------------
+# Checks if gist id is valid.
+# -----------------------------------------------
+validate_gist() {
+  if [ -n "$GIST_ID" ]; then
+    if ! gh gist view "$GIST_ID" >/dev/null; then
+      echo -e "\nAborted. Gist id not found. Run 'brew hops init' to get started."
+      sed -i '' "s/GIST_ID=.*/GIST_ID=\"\"/" "$HOPS_FILE"
+      exit 1
+    fi
+  fi
+}
+
+# -----------------------------------------------
+# If gist id is not configured, loads the first
+# gist that matches the hops description, and
+# updates the Hopsfile.
+# -----------------------------------------------
+load_gist() {
+  if [ -z "$GIST_ID" ]; then
+    gists=$(gh gist list --secret --limit 100)
+    gist=$(echo "$gists" | grep "$HOPS_DESC" | awk '{print $1}')
+    if [ -n "$gist" ]; then
+      GIST_ID="$gist"
+      sed -i '' "s|GIST_ID=.*|GIST_ID=\"$GIST_ID\"|" "$HOPS_FILE"
+      echo "$GRNARW Loaded gist id $GIST_ID"
+    fi
+  fi
+}
+
+# -----------------------------------------------
+# Creates a gist if one isn't already configured.
+# -----------------------------------------------
+create_gist() {
+  if [ -z "$GIST_ID" ]; then
+    gist=$(gh gist create -d "$HOPS_DESC" "$HOPS_BANNER" 2>&1)
+    GIST_URL=$(echo "$gist" | tail -n 1)
+    GIST_ID="${GIST_URL##*/}"
+    sed -i '' "s|GIST_ID=.*|GIST_ID=\"$GIST_ID\"|" "$HOPS_FILE"
+    echo "$GRNARW Created gist $GIST_URL"
+  fi
+}
+
+# -----------------------------------------------
+# Authenticates with github using the token in
+# the Hopsfile.
+# -----------------------------------------------
+auth_github() {
+  if ! gh auth status >/dev/null 2>&1; then
+    if ! gh auth login --with-token <<< "$GITHUB_TOKEN" >/dev/null 2>&1; then
+      echo -e "\nAborted. Failed to authenticate with github."
+      print_debug
+      exit 1
+    fi
+
+    echo "$GRNARW Authenticated with github"
+  fi
+}
+
+# -----------------------------------------------
+# If the --host option is used, the local
+# Brewfile will be overwritten with the state
+# from the specified host.
+# -----------------------------------------------
+merge_state() {
+  if [ -n "$REMOTE_HOST" ]; then
+    echo "$BLUARW Merging state from $REMOTE_HOST"
+
+    if ! gh gist view "$GIST_ID" -f "$REMOTE_HOST" >/dev/null 2>&1; then
+      echo -e "\nAborted. Host not found."
+      print_debug
+      exit 1
+    fi
+
+    if ! gh gist view "$GIST_ID" -f "$REMOTE_HOST" > "$BREW_FILE.tmp"; then
+      echo -e "\nAborted. Failed to download state file."
+      print_debug
+      exit 1
+    fi
+
+    mv "$BREW_FILE.tmp" "$BREW_FILE"
+  fi
+}
+
+# -----------------------------------------------
+# Installs the local Brewfile.
+# -----------------------------------------------
+install_bundle() {
+  if [ -n "$REMOTE_HOST" ]; then
+    echo "$BLUARW Installing bundle"
+    if ! brew bundle install --quiet --file="$BREW_FILE" >/dev/null 2>&1; then
+      echo -e "\nAborted. Failed to install bundle."
+      print_debug
+      exit 1
+    fi
+  fi
+}
+
+# -----------------------------------------------
+# Updates the local Brewfile.
+# -----------------------------------------------
+update_brewfile() {
+  if [ -z "$REMOTE_HOST" ]; then
+    echo "$BLUARW Updating Brewfile"
+    if ! brew bundle dump --quiet --force --file="$BREW_FILE"; then
+      echo -e "\nAborted. Failed to update Brewfile."
+      print_debug
+      exit 1
+    fi
+  fi
+}
+
+# -----------------------------------------------
+# Pushes the local Brewfile to gist.
+# -----------------------------------------------
+update_gist() {
+  if [ -z "$REMOTE_HOST" ]; then
+    echo "$BLUARW Updating gist"
+
+    if gh gist view "$GIST_ID" -f "$(hostname)" >/dev/null 2>&1; then
+      INITIAL_SYNC=true
+    fi
+
+    if [ "$INITIAL_SYNC" == false ]; then
+      if ! gh gist edit "$GIST_ID" -a "$(hostname)" "$BREW_FILE"; then
+        echo -e "\nAborted. Failed to add state file to gist."
+        print_debug
+        exit 1
+      fi
+    else
+      if ! gh gist edit "$GIST_ID" -f "$(hostname)" "$BREW_FILE"; then
+        echo -e "\nAborted. Failed to update state file."
+        print_debug
+        exit 1
+      fi
+    fi
+  fi
+}
+
+#-----------------------------------------------
+# Initialize hops backend and gist:
+#-----------------------------------------------
+init() {
+  # check for required args
+  check_args
+
+  # create home directory
+  create_home
+
+  # update token id
+  update_token
+
+  # log into the github cli
+  auth_github
+
+  # attempt to load existing gist
+  load_gist
+
+  # create gist, if needed
+  create_gist
+
+  echo -e "\nHops initialized 🍻"
+}
+
+#-----------------------------------------------
+# Sync homebrew state with gist:
+#-----------------------------------------------
+sync() {
+  # check if backend is configured
+  check_backend
+
+  # ensure github cli is logged in
+  auth_github
+
+  # validate the provided gist id
+  validate_gist
+
+  # merge state from another host
+  merge_state
+
+  # install the local bundle
+  install_bundle
+
+  # update the local state file
+  update_brewfile
+
+  # update the remote state file
+  update_gist
+
+  echo -e "\nHops synchronized 🍻"
+}
+
+# -----------------------------------------------
+# Runs the hops init or sync subcommand.
+# -----------------------------------------------
+run_subcmd() {
+  case "$1" in
+  init)
+    init
+    ;;
+  sync)
+    sync
+    ;;
+  *)
+    echo -e "Unknown command: $1\n"
+    brew hops --help
+    exit 1
+    ;;
+  esac
+}
+
+install_deps
+load_backend
+parse_args "$@"
+run_subcmd "$1"
+print_debug
