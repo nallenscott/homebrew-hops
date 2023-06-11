@@ -45,7 +45,7 @@ BLUARW=$'\e[1;34m==>\e[0m'
 # Prints the latest git tag.
 # -----------------------------------------------
 print_version() {
-  echo "v$(git describe --tags --abbrev=0)"
+  git describe --tags --abbrev=0
 }
 
 # -----------------------------------------------
