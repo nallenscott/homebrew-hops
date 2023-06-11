@@ -400,6 +400,11 @@ sync() {
 # Runs the hops init or sync subcommand.
 # -----------------------------------------------
 run_subcmd() {
+  if [ -n "$1" ]; then
+    install_deps
+    load_backend
+  fi
+
   case "$1" in
   init)
     init
@@ -415,8 +420,6 @@ run_subcmd() {
   esac
 }
 
-install_deps
-load_backend
 parse_args "$@"
 run_subcmd "$1"
 print_debug
